@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Downloaded videos (copyright content)
+videos/
+
+# Status and data files
+download-status.json
+video-urls.json
+failed-downloads.json
+
+# Debug files
+login-debug.png
+*.log
+
+# macOS
+.DS_Store
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude
+.claude/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Config (contains personal course URL)
+config.json
