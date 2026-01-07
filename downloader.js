@@ -190,6 +190,13 @@ async function closePopup() {
 }
 
 /**
+ * 클립 고유 키 생성 (상태 매칭용)
+ */
+function getClipKey(clip) {
+    return `${clip.partNum}-${clip.chapterNum}-${clip.clipNum}-${clip.title}`;
+}
+
+/**
  * 실시간 수집 결과 브로드캐스트 (정렬 후 인덱스 재할당)
  */
 function broadcastCollectedResults(statusMap) {
@@ -200,14 +207,18 @@ function broadcastCollectedResults(statusMap) {
         return a.clipNum - b.clipNum;
     });
 
-    // 인덱스 재할당 및 상태 복원
+    // 인덱스 재할당 및 상태 복원 (클립 키 기반 매칭)
     const indexed = sorted.map((clip, idx) => {
         const globalIndex = idx + 1;
-        const existingStatus = statusMap[globalIndex] || 'pending';
+        const clipKey = getClipKey(clip);
+        const saved = statusMap[clipKey];
+        const existingStatus = saved ? saved.status : 'pending';
+        const existingUrl = saved ? saved.m3u8_url : null;
         return {
             ...clip,
             index: globalIndex,
             status: existingStatus,
+            m3u8_url: existingUrl || clip.m3u8_url,
             selected: existingStatus !== 'completed'
         };
     });
@@ -426,12 +437,18 @@ async function fetchList(courseUrl) {
     // 공유 결과 배열 초기화
     sharedCollectedResults = [];
 
-    // 기존 상태 로드
+    // 기존 상태 로드 (클립 키 기반 매칭)
     const savedStatus = loadStatus();
     const statusMap = {};
     savedStatus.forEach(s => {
-        statusMap[s.index] = s.status;
+        const key = getClipKey(s);
+        statusMap[key] = { status: s.status, m3u8_url: s.m3u8_url };
     });
+
+    if (savedStatus.length > 0) {
+        const completedCount = savedStatus.filter(s => s.status === 'completed').length;
+        onLog('info', `저장된 상태 로드: ${savedStatus.length}개 (완료: ${completedCount}개)`);
+    }
 
     onLog('info', '강의 페이지로 이동 중...');
     onProgress({ type: 'fetch', current: 0, total: 100, percent: 0 });
@@ -493,16 +510,26 @@ async function fetchList(courseUrl) {
         return a.clipNum - b.clipNum;
     });
 
+    // 클립 키 기반으로 이전 상태 병합
     const allResults = sorted.map((clip, idx) => {
         const globalIndex = idx + 1;
-        const existingStatus = statusMap[globalIndex] || 'pending';
+        const clipKey = getClipKey(clip);
+        const saved = statusMap[clipKey];
+        const existingStatus = saved ? saved.status : 'pending';
+        const existingUrl = saved ? saved.m3u8_url : null;
         return {
             ...clip,
             index: globalIndex,
             status: existingStatus,
+            m3u8_url: existingUrl || clip.m3u8_url,
             selected: existingStatus !== 'completed'
         };
     });
+
+    const completedCount = allResults.filter(c => c.status === 'completed').length;
+    if (completedCount > 0) {
+        onLog('info', `이전 작업 복원: ${completedCount}개 완료됨`);
+    }
 
     onLog('info', `총 ${allResults.length}개 클립 발견`);
 
@@ -726,7 +753,7 @@ async function downloadClip(clip, outputDir) {
 }
 
 /**
- * 선택된 항목 다운로드
+ * 다운로드 - download_ex.js 방식 (워커가 큐 폴링)
  */
 async function downloadItems(items, outputDir) {
     if (isRunning) {
@@ -734,40 +761,40 @@ async function downloadItems(items, outputDir) {
     }
 
     isRunning = true;
-    downloadQueue = [...items];
-    let completedCount = 0;
-    let failedCount = 0;
     const total = items.length;
 
     if (!fs.existsSync(outputDir)) {
         fs.mkdirSync(outputDir, { recursive: true });
     }
 
-    onLog('info', `📥 다운로드 시작: ${total}개 항목`);
+    onLog('info', `📥 다운로드 시작: ${total}개 항목 (동시 최대 ${MAX_CONCURRENT_DOWNLOADS}개)`);
 
-    // 순차 다운로드 (URL 수집이 브라우저 필요)
-    for (const clip of downloadQueue) {
-        if (!isRunning) break;
+    // 다운로드 큐와 상태
+    downloadQueue = [];
+    activeDownloads = 0;
+    let urlCollectedCount = 0;
+    let downloadCompletedCount = 0;
+    let downloadFailedCount = 0;
+    let skippedCount = 0;
 
-        const result = await downloadClip(clip, outputDir);
-
-        if (result.success) {
-            if (!result.skipped) completedCount++;
-        } else {
-            failedCount++;
-        }
-
-        // 전체 진행률
-        const processed = completedCount + failedCount;
+    // 진행률 업데이트
+    const updateProgress = () => {
+        const processed = downloadCompletedCount + downloadFailedCount + skippedCount;
         onProgress({
-            type: 'overall',
-            completed: completedCount,
-            failed: failedCount,
+            type: 'pipeline',
+            urlCollected: urlCollectedCount,
+            completed: downloadCompletedCount,
+            failed: downloadFailedCount,
+            skipped: skippedCount,
+            downloading: activeDownloads,
+            queued: downloadQueue.length,
             total,
             percent: Math.round((processed / total) * 100)
         });
+    };
 
-        // 상태 저장
+    // 상태 저장
+    const saveClipStatus = (clip) => {
         const allClips = loadStatus();
         const idx = allClips.findIndex(c => c.index === clip.index);
         if (idx >= 0) {
@@ -775,15 +802,139 @@ async function downloadItems(items, outputDir) {
             allClips[idx].m3u8_url = clip.m3u8_url;
         }
         saveStatus(allClips);
+    };
+
+    // 단일 클립 다운로드
+    const downloadSingleClip = async (job) => {
+        const { clip, outputPath } = job;
+        let success = false;
+
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            if (!isRunning) break;
+
+            if (attempt === 1) {
+                onLog('info', `⬇️ [진행:${activeDownloads} 대기:${downloadQueue.length}] ${clip.title.slice(0, 35)}`);
+            } else {
+                onLog('warn', `🔄 재시도 ${attempt}/${MAX_RETRIES}: ${clip.title.slice(0, 30)}`);
+            }
+
+            onStatusChange(clip.index, 'downloading');
+            const result = await downloadVideoOnce(clip.m3u8_url, outputPath);
+
+            if (result.success) {
+                success = true;
+                break;
+            }
+
+            if (attempt < MAX_RETRIES) {
+                await new Promise(r => setTimeout(r, 2000));
+            }
+        }
+
+        if (success) {
+            onLog('info', `✅ 완료: ${clip.title.slice(0, 40)}`);
+            clip.status = 'completed';
+            onStatusChange(clip.index, 'completed');
+            downloadCompletedCount++;
+        } else {
+            onLog('error', `❌ 실패: ${clip.title.slice(0, 40)}`);
+            clip.status = 'failed';
+            onStatusChange(clip.index, 'failed');
+            downloadFailedCount++;
+        }
+
+        saveClipStatus(clip);
+        updateProgress();
+    };
+
+    // 다운로드 워커 (큐 폴링 방식)
+    const downloadWorker = async () => {
+        while (isRunning) {
+            if (downloadQueue.length > 0 && activeDownloads < MAX_CONCURRENT_DOWNLOADS) {
+                const job = downloadQueue.shift();
+                activeDownloads++;
+                await downloadSingleClip(job);
+                activeDownloads--;
+            } else {
+                await new Promise(r => setTimeout(r, 100));
+            }
+        }
+    };
+
+    // 워커 3개 시작 (백그라운드)
+    for (let i = 0; i < MAX_CONCURRENT_DOWNLOADS; i++) {
+        downloadWorker();
+    }
+
+    // URL 수집하면서 큐에 추가
+    for (const clip of items) {
+        if (!isRunning) break;
+
+        // 파일명 생성
+        const hasChapterInTitle = /^CH?\d+/i.test(clip.title.trim());
+        const titlePart = sanitizeFilename(clip.title);
+        const chapterPart = clip.chapterPrefix || `Ch${clip.chapterNum}`;
+        const filename = hasChapterInTitle
+            ? `PART${clip.partNum}-${titlePart}.mp4`
+            : `PART${clip.partNum}-${chapterPart}-${titlePart}.mp4`;
+
+        const partDir = path.join(outputDir, sanitizeFilename(clip.partTitle));
+        if (!fs.existsSync(partDir)) {
+            fs.mkdirSync(partDir, { recursive: true });
+        }
+        const outputPath = path.join(partDir, filename);
+
+        // 이미 존재하면 스킵
+        if (fs.existsSync(outputPath)) {
+            onLog('info', `📁 스킵: ${filename.slice(0, 45)}`);
+            clip.status = 'completed';
+            skippedCount++;
+            urlCollectedCount++;
+            saveClipStatus(clip);
+            updateProgress();
+            continue;
+        }
+
+        // URL 수집
+        if (!clip.m3u8_url) {
+            onLog('info', `🔍 URL 수집 (${urlCollectedCount + 1}/${total}): ${clip.title.slice(0, 30)}`);
+            clip.m3u8_url = await collectClipUrl(clip);
+
+            if (!clip.m3u8_url) {
+                onLog('error', `URL 수집 실패: ${clip.title.slice(0, 30)}`);
+                clip.status = 'failed';
+                onStatusChange(clip.index, 'failed');
+                downloadFailedCount++;
+                urlCollectedCount++;
+                saveClipStatus(clip);
+                updateProgress();
+                continue;
+            }
+        }
+
+        urlCollectedCount++;
+
+        // 큐에 추가 (워커가 가져감)
+        downloadQueue.push({ clip, outputPath });
+        onLog('info', `📋 큐 추가 [진행:${activeDownloads} 대기:${downloadQueue.length}]`);
+        updateProgress();
+    }
+
+    // 남은 다운로드 완료 대기
+    onLog('info', `⏳ 남은 다운로드 완료 대기...`);
+    while (downloadQueue.length > 0 || activeDownloads > 0) {
+        onLog('info', `  대기: ${downloadQueue.length}, 진행: ${activeDownloads}, 완료: ${downloadCompletedCount}`);
+        await new Promise(r => setTimeout(r, 2000));
     }
 
     isRunning = false;
-    onLog('info', `✅ 다운로드 완료: 성공 ${completedCount}, 실패 ${failedCount}`);
+    onLog('info', `✅ 완료: 성공 ${downloadCompletedCount}, 스킵 ${skippedCount}, 실패 ${downloadFailedCount}`);
 
     return {
         success: true,
-        completed: completedCount,
-        failed: failedCount
+        completed: downloadCompletedCount,
+        skipped: skippedCount,
+        failed: downloadFailedCount
     };
 }
 
@@ -793,6 +944,17 @@ async function downloadItems(items, outputDir) {
 function stopDownload() {
     isRunning = false;
     onLog('warn', '다운로드 중지 요청됨');
+}
+
+/**
+ * 상태 초기화 (목록 삭제)
+ */
+function clearStatus() {
+    if (fs.existsSync(STATUS_FILE)) {
+        fs.unlinkSync(STATUS_FILE);
+        onLog('info', '저장된 목록이 삭제되었습니다');
+    }
+    return { success: true };
 }
 
 /**
@@ -818,5 +980,6 @@ module.exports = {
     closeBrowser,
     getStatus,
     loadStatus,
-    saveStatus
+    saveStatus,
+    clearStatus
 };

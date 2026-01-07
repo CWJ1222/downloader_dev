@@ -114,6 +114,12 @@
             background: #dc2626;
         }
 
+        .btn-small {
+            flex: none;
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
         /* 상태 표시 */
         .status-bar {
             display: flex;
@@ -359,7 +365,10 @@
                     <input type="checkbox" id="selectAll">
                     <span>전체 선택</span>
                 </label>
-                <span id="listCount">0개 항목</span>
+                <div style="display: flex; align-items: center; gap: 12px;">
+                    <span id="listCount">0개 항목</span>
+                    <button class="btn-small btn-danger" id="btnClearList" style="display: none;">목록 삭제</button>
+                </div>
             </div>
             <div class="list-container" id="listContainer">
                 <p style="color: #666; text-align: center; padding: 40px;">
@@ -407,7 +416,8 @@
             completedCount: document.getElementById('completedCount'),
             inProgressCount: document.getElementById('inProgressCount'),
             pendingCount: document.getElementById('pendingCount'),
-            listCount: document.getElementById('listCount')
+            listCount: document.getElementById('listCount'),
+            btnClearList: document.getElementById('btnClearList')
         };
 
         // 초기화
@@ -433,6 +443,7 @@
             elements.btnFetchList.addEventListener('click', fetchList);
             elements.btnDownload.addEventListener('click', startDownload);
             elements.selectAll.addEventListener('change', toggleSelectAll);
+            elements.btnClearList.addEventListener('click', clearList);
 
             // 초기 다운로드 버튼 상태
             updateDownloadButton();
@@ -491,8 +502,25 @@
 
         // 진행률 처리
         function handleProgress(data) {
-            if (data.type === 'overall') {
-                // 전체 진행률
+            if (data.type === 'pipeline') {
+                // 파이프라인 진행률 (URL 수집 + 병렬 다운로드)
+                elements.progressFill.style.width = data.percent + '%';
+                const statusParts = [];
+                statusParts.push(`URL: ${data.urlCollected}/${data.total}`);
+                if (data.downloading > 0) statusParts.push(`다운로드 중: ${data.downloading}`);
+                if (data.queued > 0) statusParts.push(`대기: ${data.queued}`);
+                statusParts.push(`완료: ${data.completed}`);
+                if (data.skipped > 0) statusParts.push(`스킵: ${data.skipped}`);
+                if (data.failed > 0) statusParts.push(`실패: ${data.failed}`);
+                statusParts.push(`(${data.percent}%)`);
+                elements.progressText.textContent = statusParts.join(' | ');
+
+                // 실시간 카운트 업데이트
+                elements.completedCount.textContent = data.completed + data.skipped;
+                elements.inProgressCount.textContent = data.downloading;
+                elements.pendingCount.textContent = data.total - data.completed - data.skipped - data.failed - data.downloading;
+            } else if (data.type === 'overall') {
+                // 전체 진행률 (레거시 호환)
                 elements.progressFill.style.width = data.percent + '%';
                 elements.progressText.textContent = `전체: ${data.completed + data.failed}/${data.total} (${data.percent}%) - 성공: ${data.completed}, 실패: ${data.failed}`;
             } else if (data.type === 'download') {
@@ -530,9 +558,9 @@
         // 다운로드 완료 처리
         function handleDownloadComplete(data) {
             isDownloading = false;
-            elements.btnDownload.disabled = false;
-            elements.btnDownload.textContent = '선택 항목 다운로드';
-            addLog(`다운로드 완료: 성공 ${data.completed}, 실패 ${data.failed}`, data.failed > 0 ? 'warn' : 'info');
+            updateDownloadButton();
+            const skipMsg = data.skipped ? `, 스킵 ${data.skipped}` : '';
+            addLog(`다운로드 완료: 성공 ${data.completed}${skipMsg}, 실패 ${data.failed}`, data.failed > 0 ? 'warn' : 'info');
         }
 
         // 목록 가져오기
@@ -601,23 +629,74 @@
             }
         }
 
+        // 다운로드 중지
+        async function stopDownload() {
+            try {
+                elements.btnDownload.textContent = '중지 중...';
+                elements.btnDownload.disabled = true;
+                await fetch('/api/stop', { method: 'POST' });
+                addLog('다운로드 중지 요청됨', 'warn');
+            } catch (error) {
+                addLog('중지 오류: ' + error.message, 'error');
+            }
+        }
+
+        // 목록 삭제
+        async function clearList() {
+            if (!confirm('저장된 목록과 진행 상태를 모두 삭제하시겠습니까?')) {
+                return;
+            }
+
+            try {
+                await fetch('/api/clear-status', { method: 'POST' });
+                clipList = [];
+                elements.listContainer.innerHTML = '<p style="color: #666; text-align: center; padding: 40px;">목록 가져오기를 클릭하여 강의 목록을 불러오세요</p>';
+                elements.listCount.textContent = '0개 항목';
+                elements.btnClearList.style.display = 'none';
+                updateCounts();
+                addLog('목록이 초기화되었습니다', 'info');
+            } catch (error) {
+                addLog('목록 삭제 오류: ' + error.message, 'error');
+            }
+        }
+
         // 다운로드 버튼 상태 업데이트
         function updateDownloadButton() {
             const hasItems = clipList.length > 0;
             const hasSelected = clipList.some(c => c.selected && c.status !== 'completed');
-            elements.btnDownload.disabled = !isLoggedIn || !hasItems || !hasSelected || isDownloading;
 
-            if (!isLoggedIn) {
-                elements.btnDownload.title = '먼저 로그인하세요';
-            } else if (!hasSelected) {
-                elements.btnDownload.title = '다운로드할 항목을 선택하세요';
+            if (isDownloading) {
+                // 다운로드 중일 때는 중지 버튼으로 변경
+                elements.btnDownload.disabled = false;
+                elements.btnDownload.textContent = '⏹ 다운로드 중지';
+                elements.btnDownload.classList.remove('btn-primary');
+                elements.btnDownload.classList.add('btn-danger');
+                elements.btnDownload.title = '클릭하여 다운로드 중지';
             } else {
-                elements.btnDownload.title = '';
+                // 다운로드 중이 아닐 때
+                elements.btnDownload.disabled = !isLoggedIn || !hasItems || !hasSelected;
+                elements.btnDownload.textContent = '선택 항목 다운로드';
+                elements.btnDownload.classList.remove('btn-danger');
+                elements.btnDownload.classList.add('btn-primary');
+
+                if (!isLoggedIn) {
+                    elements.btnDownload.title = '먼저 로그인하세요';
+                } else if (!hasSelected) {
+                    elements.btnDownload.title = '다운로드할 항목을 선택하세요';
+                } else {
+                    elements.btnDownload.title = '';
+                }
             }
         }
 
-        // 다운로드 시작
+        // 다운로드 시작/중지 토글
         async function startDownload() {
+            // 이미 다운로드 중이면 중지
+            if (isDownloading) {
+                await stopDownload();
+                return;
+            }
+
             const selectedItems = clipList.filter(item => item.selected && item.status !== 'completed');
             if (selectedItems.length === 0) {
                 addLog('다운로드할 항목을 선택하세요 (완료된 항목 제외)', 'warn');
@@ -625,8 +704,7 @@
             }
 
             isDownloading = true;
-            elements.btnDownload.disabled = true;
-            elements.btnDownload.textContent = '다운로드 중...';
+            updateDownloadButton();
             elements.progressFill.style.width = '0%';
             elements.progressText.textContent = '다운로드 준비 중...';
 
@@ -643,14 +721,12 @@
                 if (!result.success) {
                     addLog(result.message, 'error');
                     isDownloading = false;
-                    elements.btnDownload.disabled = false;
-                    elements.btnDownload.textContent = '선택 항목 다운로드';
+                    updateDownloadButton();
                 }
             } catch (error) {
                 addLog('오류: ' + error.message, 'error');
                 isDownloading = false;
-                elements.btnDownload.disabled = false;
-                elements.btnDownload.textContent = '선택 항목 다운로드';
+                updateDownloadButton();
             }
         }
 
@@ -662,6 +738,9 @@
             }));
 
             elements.listCount.textContent = `${items.length}개 항목`;
+
+            // 목록 삭제 버튼 표시/숨김
+            elements.btnClearList.style.display = items.length > 0 ? 'inline-block' : 'none';
 
             if (items.length === 0) {
                 elements.listContainer.innerHTML = '<p style="color: #666; text-align: center; padding: 40px;">항목이 없습니다</p>';

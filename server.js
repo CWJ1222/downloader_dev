@@ -27,7 +27,8 @@ const DEFAULT_COURSE_URL = config.courseUrl;
 const DEFAULT_OUTPUT_DIR = config.outputDir || './videos';
 
 // Middleware
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // WebSocket 연결 관리
@@ -205,6 +206,15 @@ app.post('/api/stop', (req, res) => {
     res.json({
         success: true,
         message: '다운로드 중지 요청됨'
+    });
+});
+
+// API: 목록 초기화 (저장된 상태 삭제)
+app.post('/api/clear-status', (req, res) => {
+    const result = downloader.clearStatus();
+    res.json({
+        success: true,
+        message: '목록이 초기화되었습니다'
     });
 });
 
