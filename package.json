@@ -1,0 +1,18 @@
+{
+  "name": "fastcamp-downloader",
+  "version": "2.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "cli": "node collect-and-download.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "패스트캠퍼스 KDT 강의 다운로더",
+  "dependencies": {
+    "express": "^4.18.2",
+    "playwright": "^1.57.0",
+    "ws": "^8.16.0"
+  }
+}

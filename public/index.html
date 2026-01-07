@@ -1,0 +1,795 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fastcamp Downloader</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            color: #4ecca3;
+        }
+
+        .card {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 6px;
+            color: #888;
+            font-size: 14px;
+        }
+
+        input[type="text"],
+        input[type="email"],
+        input[type="password"] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #333;
+            border-radius: 8px;
+            background: #0f0f23;
+            color: #fff;
+            font-size: 14px;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: #4ecca3;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 12px;
+            margin-top: 20px;
+        }
+
+        button {
+            flex: 1;
+            padding: 14px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: #4ecca3;
+            color: #1a1a2e;
+        }
+
+        .btn-primary:hover {
+            background: #3db892;
+        }
+
+        .btn-secondary {
+            background: #374151;
+            color: #fff;
+        }
+
+        .btn-secondary:hover {
+            background: #4b5563;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-danger {
+            background: #ef4444;
+            color: #fff;
+        }
+
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+
+        /* 상태 표시 */
+        .status-bar {
+            display: flex;
+            justify-content: space-between;
+            padding: 12px 16px;
+            background: #0f0f23;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #666;
+        }
+
+        .status-dot.connected {
+            background: #4ecca3;
+        }
+
+        /* 진행률 바 */
+        .progress-container {
+            margin-top: 20px;
+        }
+
+        .progress-bar {
+            height: 8px;
+            background: #0f0f23;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4ecca3, #45b7d1);
+            width: 0%;
+            transition: width 0.3s;
+        }
+
+        .progress-text {
+            text-align: center;
+            margin-top: 8px;
+            color: #888;
+            font-size: 14px;
+        }
+
+        /* 목록 */
+        .list-container {
+            max-height: 400px;
+            overflow-y: auto;
+            margin-top: 16px;
+        }
+
+        .list-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .select-all {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+        }
+
+        .part-group {
+            margin-bottom: 12px;
+        }
+
+        .part-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px;
+            background: #1f2937;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        .part-header:hover {
+            background: #2d3748;
+        }
+
+        .part-title {
+            flex: 1;
+            font-weight: 500;
+        }
+
+        .part-count {
+            color: #888;
+            font-size: 13px;
+        }
+
+        .clip-list {
+            padding-left: 24px;
+            margin-top: 4px;
+        }
+
+        .clip-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            border-radius: 4px;
+        }
+
+        .clip-item:hover {
+            background: #1f2937;
+        }
+
+        .clip-title {
+            flex: 1;
+            font-size: 14px;
+        }
+
+        .clip-status {
+            font-size: 16px;
+        }
+
+        .clip-progress {
+            width: 100px;
+            font-size: 12px;
+            color: #888;
+        }
+
+        /* 로그 */
+        .log-container {
+            background: #0f0f23;
+            border-radius: 8px;
+            padding: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 13px;
+        }
+
+        .log-entry {
+            padding: 4px 0;
+            border-bottom: 1px solid #1f2937;
+        }
+
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+
+        .log-time {
+            color: #666;
+            margin-right: 8px;
+        }
+
+        .log-info { color: #4ecca3; }
+        .log-error { color: #ef4444; }
+        .log-warn { color: #f59e0b; }
+
+        /* 스크롤바 */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #0f0f23;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #374151;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #4b5563;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Fastcamp Downloader</h1>
+
+        <!-- 설정 카드 -->
+        <div class="card">
+            <div class="form-group">
+                <label>강의 URL</label>
+                <input type="text" id="courseUrl" placeholder="https://kdt.fastcampus.co.kr/classroom/...">
+            </div>
+            <div class="form-group">
+                <label>이메일</label>
+                <input type="email" id="email" placeholder="fastcampus@example.com">
+            </div>
+            <div class="form-group">
+                <label>비밀번호</label>
+                <input type="password" id="password" placeholder="••••••••">
+            </div>
+            <div class="form-group">
+                <label>저장 폴더</label>
+                <input type="text" id="outputDir" placeholder="./videos">
+            </div>
+            <div class="btn-group">
+                <button class="btn-secondary" id="btnFetchList">목록 가져오기</button>
+                <button class="btn-primary" id="btnDownload" disabled>선택 항목 다운로드</button>
+            </div>
+        </div>
+
+        <!-- 상태 카드 -->
+        <div class="card">
+            <div class="status-bar">
+                <div class="status-item">
+                    <span class="status-dot" id="wsStatus"></span>
+                    <span id="wsStatusText">연결 중...</span>
+                </div>
+                <div class="status-item">
+                    <span>완료: <strong id="completedCount">0</strong></span>
+                </div>
+                <div class="status-item">
+                    <span>진행: <strong id="inProgressCount">0</strong></span>
+                </div>
+                <div class="status-item">
+                    <span>대기: <strong id="pendingCount">0</strong></span>
+                </div>
+            </div>
+
+            <div class="progress-container">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <div class="progress-text" id="progressText">대기 중</div>
+            </div>
+        </div>
+
+        <!-- 목록 카드 -->
+        <div class="card">
+            <div class="list-header">
+                <label class="select-all">
+                    <input type="checkbox" id="selectAll">
+                    <span>전체 선택</span>
+                </label>
+                <span id="listCount">0개 항목</span>
+            </div>
+            <div class="list-container" id="listContainer">
+                <p style="color: #666; text-align: center; padding: 40px;">
+                    목록 가져오기를 클릭하여 강의 목록을 불러오세요
+                </p>
+            </div>
+        </div>
+
+        <!-- 로그 카드 -->
+        <div class="card">
+            <h3 style="margin-bottom: 12px; font-size: 14px; color: #888;">로그</h3>
+            <div class="log-container" id="logContainer">
+                <div class="log-entry">
+                    <span class="log-time">--:--:--</span>
+                    <span class="log-info">시스템 준비 완료</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 상태
+        let ws = null;
+        let clipList = [];
+        let isDownloading = false;
+        let isFetching = false;
+        let isLoggedIn = false;
+        let currentDownloadFile = '';
+
+        // DOM 요소
+        const elements = {
+            courseUrl: document.getElementById('courseUrl'),
+            email: document.getElementById('email'),
+            password: document.getElementById('password'),
+            outputDir: document.getElementById('outputDir'),
+            btnFetchList: document.getElementById('btnFetchList'),
+            btnDownload: document.getElementById('btnDownload'),
+            wsStatus: document.getElementById('wsStatus'),
+            wsStatusText: document.getElementById('wsStatusText'),
+            progressFill: document.getElementById('progressFill'),
+            progressText: document.getElementById('progressText'),
+            listContainer: document.getElementById('listContainer'),
+            logContainer: document.getElementById('logContainer'),
+            selectAll: document.getElementById('selectAll'),
+            completedCount: document.getElementById('completedCount'),
+            inProgressCount: document.getElementById('inProgressCount'),
+            pendingCount: document.getElementById('pendingCount'),
+            listCount: document.getElementById('listCount')
+        };
+
+        // 초기화
+        async function init() {
+            // 기본 설정 로드
+            const config = await fetch('/api/config').then(r => r.json());
+            elements.courseUrl.value = config.defaultCourseUrl;
+            elements.outputDir.value = config.defaultOutputDir;
+
+            // 저장된 상태 로드
+            try {
+                const saved = await fetch('/api/saved-status').then(r => r.json());
+                if (saved.success && saved.data.length > 0) {
+                    renderList(saved.data);
+                    addLog(`저장된 상태 로드: ${saved.data.length}개 항목`, 'info');
+                }
+            } catch (e) {}
+
+            // WebSocket 연결
+            connectWebSocket();
+
+            // 이벤트 리스너
+            elements.btnFetchList.addEventListener('click', fetchList);
+            elements.btnDownload.addEventListener('click', startDownload);
+            elements.selectAll.addEventListener('change', toggleSelectAll);
+
+            // 초기 다운로드 버튼 상태
+            updateDownloadButton();
+        }
+
+        // WebSocket 연결
+        function connectWebSocket() {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}`);
+
+            ws.onopen = () => {
+                elements.wsStatus.classList.add('connected');
+                elements.wsStatusText.textContent = '연결됨';
+                addLog('WebSocket 연결됨', 'info');
+            };
+
+            ws.onclose = () => {
+                elements.wsStatus.classList.remove('connected');
+                elements.wsStatusText.textContent = '연결 끊김';
+                setTimeout(connectWebSocket, 3000);
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleMessage(data);
+            };
+        }
+
+        // 메시지 처리
+        function handleMessage(msg) {
+            switch (msg.type) {
+                case 'progress':
+                    handleProgress(msg.data);
+                    break;
+                case 'clipStatus':
+                    updateClipStatus(msg.clipIndex, msg.status);
+                    break;
+                case 'log':
+                    addLog(msg.message, msg.level);
+                    break;
+                case 'downloadComplete':
+                    handleDownloadComplete(msg.data);
+                    break;
+                case 'listUpdate':
+                    // 실시간 목록 업데이트
+                    renderList(msg.data);
+                    break;
+                case 'status':
+                    // 초기 상태
+                    isLoggedIn = msg.data.isLoggedIn || false;
+                    isFetching = msg.data.isFetching || false;
+                    updateDownloadButton();
+                    break;
+            }
+        }
+
+        // 진행률 처리
+        function handleProgress(data) {
+            if (data.type === 'overall') {
+                // 전체 진행률
+                elements.progressFill.style.width = data.percent + '%';
+                elements.progressText.textContent = `전체: ${data.completed + data.failed}/${data.total} (${data.percent}%) - 성공: ${data.completed}, 실패: ${data.failed}`;
+            } else if (data.type === 'download') {
+                // 개별 파일 진행률
+                currentDownloadFile = data.file;
+                const clipItem = document.querySelector(`.clip-item[data-id] .clip-status:contains('⏳')`);
+                // 현재 다운로드 중인 파일의 진행률은 로그에 표시
+            } else if (data.type === 'fetch') {
+                // 목록 수집 진행률
+                elements.progressFill.style.width = data.percent + '%';
+                elements.progressText.textContent = `목록 수집 중: ${data.current}/${data.total} Part (${data.percent}%)`;
+                // 수집 중일 때 버튼 텍스트 변경
+                if (isFetching && data.percent > 0) {
+                    elements.btnFetchList.textContent = '⏹ 중지';
+                }
+            }
+        }
+
+        // 클립 상태 업데이트
+        function updateClipStatus(clipIndex, status) {
+            const clip = clipList.find(c => c.index === clipIndex);
+            if (clip) {
+                clip.status = status;
+                const clipItem = document.querySelector(`.clip-item[data-id="${clipIndex}"]`);
+                if (clipItem) {
+                    const statusEl = clipItem.querySelector('.clip-status');
+                    if (statusEl) {
+                        statusEl.textContent = getStatusIcon(status);
+                    }
+                }
+                updateCounts();
+            }
+        }
+
+        // 다운로드 완료 처리
+        function handleDownloadComplete(data) {
+            isDownloading = false;
+            elements.btnDownload.disabled = false;
+            elements.btnDownload.textContent = '선택 항목 다운로드';
+            addLog(`다운로드 완료: 성공 ${data.completed}, 실패 ${data.failed}`, data.failed > 0 ? 'warn' : 'info');
+        }
+
+        // 목록 가져오기
+        async function fetchList() {
+            // 이미 수집 중이면 중지
+            if (isFetching) {
+                await stopFetch();
+                return;
+            }
+
+            const email = elements.email.value;
+            const password = elements.password.value;
+            const courseUrl = elements.courseUrl.value;
+
+            if (!email || !password) {
+                addLog('이메일과 비밀번호를 입력하세요', 'error');
+                return;
+            }
+
+            isFetching = true;
+            elements.btnFetchList.textContent = '로그인 중...';
+            elements.btnFetchList.classList.remove('btn-secondary');
+            elements.btnFetchList.classList.add('btn-danger');
+            elements.progressFill.style.width = '0%';
+            elements.progressText.textContent = '로그인 중...';
+
+            try {
+                const response = await fetch('/api/fetch-list', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ courseUrl, email, password })
+                });
+                const result = await response.json();
+
+                if (result.success) {
+                    isLoggedIn = true;
+                    addLog(result.message, 'info');
+                    if (result.data && result.data.length > 0) {
+                        renderList(result.data);
+                    }
+                    elements.progressText.textContent = result.stopped ? '목록 수집 중지됨' : '목록 수집 완료';
+                } else {
+                    addLog(result.message || '목록 가져오기 실패', 'error');
+                    elements.progressText.textContent = '실패';
+                }
+            } catch (error) {
+                addLog('오류: ' + error.message, 'error');
+                elements.progressText.textContent = '오류 발생';
+            } finally {
+                isFetching = false;
+                elements.btnFetchList.textContent = '목록 가져오기';
+                elements.btnFetchList.classList.remove('btn-danger');
+                elements.btnFetchList.classList.add('btn-secondary');
+                updateDownloadButton();
+            }
+        }
+
+        // 목록 수집 중지
+        async function stopFetch() {
+            try {
+                elements.btnFetchList.textContent = '중지 중...';
+                await fetch('/api/stop-fetch', { method: 'POST' });
+                addLog('목록 수집 중지 요청됨', 'warn');
+            } catch (error) {
+                addLog('중지 오류: ' + error.message, 'error');
+            }
+        }
+
+        // 다운로드 버튼 상태 업데이트
+        function updateDownloadButton() {
+            const hasItems = clipList.length > 0;
+            const hasSelected = clipList.some(c => c.selected && c.status !== 'completed');
+            elements.btnDownload.disabled = !isLoggedIn || !hasItems || !hasSelected || isDownloading;
+
+            if (!isLoggedIn) {
+                elements.btnDownload.title = '먼저 로그인하세요';
+            } else if (!hasSelected) {
+                elements.btnDownload.title = '다운로드할 항목을 선택하세요';
+            } else {
+                elements.btnDownload.title = '';
+            }
+        }
+
+        // 다운로드 시작
+        async function startDownload() {
+            const selectedItems = clipList.filter(item => item.selected && item.status !== 'completed');
+            if (selectedItems.length === 0) {
+                addLog('다운로드할 항목을 선택하세요 (완료된 항목 제외)', 'warn');
+                return;
+            }
+
+            isDownloading = true;
+            elements.btnDownload.disabled = true;
+            elements.btnDownload.textContent = '다운로드 중...';
+            elements.progressFill.style.width = '0%';
+            elements.progressText.textContent = '다운로드 준비 중...';
+
+            try {
+                const response = await fetch('/api/download', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        items: selectedItems,
+                        outputDir: elements.outputDir.value
+                    })
+                });
+                const result = await response.json();
+                if (!result.success) {
+                    addLog(result.message, 'error');
+                    isDownloading = false;
+                    elements.btnDownload.disabled = false;
+                    elements.btnDownload.textContent = '선택 항목 다운로드';
+                }
+            } catch (error) {
+                addLog('오류: ' + error.message, 'error');
+                isDownloading = false;
+                elements.btnDownload.disabled = false;
+                elements.btnDownload.textContent = '선택 항목 다운로드';
+            }
+        }
+
+        // 목록 렌더링
+        function renderList(items) {
+            clipList = items.map(item => ({
+                ...item,
+                selected: item.selected !== undefined ? item.selected : (item.status !== 'completed')
+            }));
+
+            elements.listCount.textContent = `${items.length}개 항목`;
+
+            if (items.length === 0) {
+                elements.listContainer.innerHTML = '<p style="color: #666; text-align: center; padding: 40px;">항목이 없습니다</p>';
+                return;
+            }
+
+            // Part별로 그룹화
+            const grouped = {};
+            clipList.forEach(item => {
+                if (!grouped[item.partTitle]) {
+                    grouped[item.partTitle] = [];
+                }
+                grouped[item.partTitle].push(item);
+            });
+
+            let html = '';
+            Object.entries(grouped).forEach(([partTitle, clips]) => {
+                const completedCount = clips.filter(c => c.status === 'completed').length;
+                const allSelected = clips.every(c => c.selected);
+                html += `
+                    <div class="part-group">
+                        <div class="part-header">
+                            <input type="checkbox" class="part-checkbox" data-part="${partTitle}" ${allSelected ? 'checked' : ''}>
+                            <span class="part-title">${partTitle}</span>
+                            <span class="part-count">${completedCount}/${clips.length} 완료</span>
+                        </div>
+                        <div class="clip-list">
+                            ${clips.map(clip => `
+                                <div class="clip-item" data-id="${clip.index}">
+                                    <input type="checkbox" class="clip-checkbox" ${clip.selected ? 'checked' : ''}>
+                                    <span class="clip-status">${getStatusIcon(clip.status)}</span>
+                                    <span class="clip-title">${clip.title}</span>
+                                    <span class="clip-progress"></span>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            });
+
+            elements.listContainer.innerHTML = html;
+
+            // Part 체크박스 이벤트
+            document.querySelectorAll('.part-checkbox').forEach(cb => {
+                cb.addEventListener('change', (e) => {
+                    const partTitle = e.target.dataset.part;
+                    const checked = e.target.checked;
+                    clipList.filter(c => c.partTitle === partTitle).forEach(c => c.selected = checked);
+                    e.target.closest('.part-group').querySelectorAll('.clip-checkbox').forEach(ccb => ccb.checked = checked);
+                    updateCounts();
+                });
+            });
+
+            // 클립 체크박스 이벤트
+            document.querySelectorAll('.clip-checkbox').forEach(cb => {
+                cb.addEventListener('change', (e) => {
+                    const id = parseInt(e.target.closest('.clip-item').dataset.id);
+                    const clip = clipList.find(c => c.index === id);
+                    if (clip) clip.selected = e.target.checked;
+                    updateCounts();
+                    updatePartCheckbox(clip.partTitle);
+                });
+            });
+
+            updateCounts();
+        }
+
+        // Part 체크박스 상태 업데이트
+        function updatePartCheckbox(partTitle) {
+            const partClips = clipList.filter(c => c.partTitle === partTitle);
+            const allSelected = partClips.every(c => c.selected);
+            const partCb = document.querySelector(`.part-checkbox[data-part="${partTitle}"]`);
+            if (partCb) partCb.checked = allSelected;
+        }
+
+        // 상태 아이콘
+        function getStatusIcon(status) {
+            switch (status) {
+                case 'completed': return '✅';
+                case 'downloading': return '⏳';
+                case 'failed': return '❌';
+                default: return '⬜';
+            }
+        }
+
+        // 전체 선택
+        function toggleSelectAll() {
+            const checked = elements.selectAll.checked;
+            clipList.forEach(item => item.selected = checked);
+            document.querySelectorAll('.clip-checkbox, .part-checkbox').forEach(cb => cb.checked = checked);
+            updateCounts();
+        }
+
+        // 카운트 업데이트
+        function updateCounts() {
+            const completed = clipList.filter(c => c.status === 'completed').length;
+            const inProgress = clipList.filter(c => c.status === 'downloading').length;
+            const pending = clipList.filter(c => !c.status || c.status === 'pending').length;
+            const failed = clipList.filter(c => c.status === 'failed').length;
+
+            elements.completedCount.textContent = completed;
+            elements.inProgressCount.textContent = inProgress;
+            elements.pendingCount.textContent = pending + failed;
+
+            // 전체 선택 체크박스 상태
+            elements.selectAll.checked = clipList.length > 0 && clipList.every(c => c.selected);
+
+            // 다운로드 버튼 상태 업데이트
+            updateDownloadButton();
+        }
+
+        // 로그 추가
+        function addLog(message, level = 'info') {
+            const time = new Date().toLocaleTimeString('ko-KR', { hour12: false });
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-${level}">${message}</span>`;
+            elements.logContainer.appendChild(entry);
+            elements.logContainer.scrollTop = elements.logContainer.scrollHeight;
+
+            // 최대 100개 로그 유지
+            while (elements.logContainer.children.length > 100) {
+                elements.logContainer.removeChild(elements.logContainer.firstChild);
+            }
+        }
+
+        // 시작
+        init();
+    </script>
+</body>
+</html>

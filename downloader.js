@@ -1,0 +1,822 @@
+const { chromium } = require('playwright');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+// 상태 파일
+const STATUS_FILE = './download-status.json';
+
+// 다운로드 설정
+const DOWNLOAD_TIMEOUT = 5 * 60 * 1000; // 5분
+const MAX_RETRIES = 3;
+const MAX_CONCURRENT_DOWNLOADS = 3;
+
+// 브라우저 인스턴스
+let browser = null;
+let browserContext = null;
+let page = null;
+
+// 병렬 수집 설정
+const PARALLEL_WORKERS = 3;
+
+// 실시간 수집 결과 (워커들이 공유)
+let sharedCollectedResults = [];
+let completedPartsCount = 0;
+let totalPartsCount = 0;
+
+// 이벤트 콜백
+let onLog = () => {};
+let onProgress = () => {};
+let onStatusChange = () => {};
+let onListUpdate = () => {};  // 목록 실시간 업데이트
+
+// 상태
+let isRunning = false;
+let isFetching = false;
+let isLoggedIn = false;
+let downloadQueue = [];
+let activeDownloads = 0;
+
+/**
+ * 콜백 설정
+ */
+function setCallbacks({ log, progress, statusChange, listUpdate }) {
+    if (log) onLog = log;
+    if (progress) onProgress = progress;
+    if (statusChange) onStatusChange = statusChange;
+    if (listUpdate) onListUpdate = listUpdate;
+}
+
+/**
+ * 파일명 정리
+ */
+function sanitizeFilename(name) {
+    return name
+        .replace(/[\/\\:*?"<>|]/g, '_')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .substring(0, 100);
+}
+
+/**
+ * 상태 저장
+ */
+function saveStatus(clips) {
+    const status = clips.map(c => ({
+        index: c.index,
+        title: c.title,
+        partNum: c.partNum,
+        partTitle: c.partTitle,
+        chapterNum: c.chapterNum,
+        chapterTitle: c.chapterTitle,
+        status: c.status || 'pending',
+        m3u8_url: c.m3u8_url
+    }));
+    fs.writeFileSync(STATUS_FILE, JSON.stringify(status, null, 2));
+}
+
+/**
+ * 상태 로드
+ */
+function loadStatus() {
+    if (fs.existsSync(STATUS_FILE)) {
+        try {
+            return JSON.parse(fs.readFileSync(STATUS_FILE, 'utf-8'));
+        } catch (e) {
+            return [];
+        }
+    }
+    return [];
+}
+
+/**
+ * 브라우저 초기화
+ */
+async function initBrowser() {
+    if (browser) return;
+
+    onLog('info', '브라우저 시작 중...');
+    browser = await chromium.launch({ headless: true });
+    browserContext = await browser.newContext();
+    page = await browserContext.newPage();
+    onLog('info', '브라우저 준비 완료 (headless 모드)');
+}
+
+/**
+ * 브라우저 종료
+ */
+async function closeBrowser() {
+    if (browser) {
+        await browser.close();
+        browser = null;
+        browserContext = null;
+        page = null;
+        onLog('info', '브라우저 종료됨');
+    }
+}
+
+/**
+ * 로그인
+ */
+async function login(email, password) {
+    await initBrowser();
+
+    onLog('info', '로그인 페이지 접속 중...');
+    await page.goto('https://kdt.fastcampus.co.kr/account/sign-in', {
+        waitUntil: 'networkidle',
+        timeout: 60000
+    });
+
+    onLog('info', '로그인 정보 입력 중...');
+
+    // 이메일 입력
+    await page.fill('input[name="user-email"]', email);
+    await page.waitForTimeout(300);
+
+    // 비밀번호 입력
+    await page.fill('input[name="user-password"]', password);
+    await page.waitForTimeout(300);
+
+    // 로그인 버튼이 활성화될 때까지 대기
+    const loginBtn = page.locator('button[data-e2e="sign-in-btn"]');
+    await loginBtn.waitFor({ state: 'attached', timeout: 10000 });
+    await page.waitForTimeout(500);
+
+    // 로그인 버튼 클릭
+    await loginBtn.click();
+    onLog('info', '로그인 버튼 클릭됨, 페이지 이동 대기...');
+
+    // 네비게이션 완료 대기
+    await page.waitForLoadState('networkidle', { timeout: 30000 });
+    await page.waitForTimeout(2000);  // 추가 대기
+
+    // 현재 URL 확인
+    const currentUrl = page.url();
+    onLog('info', `현재 URL: ${currentUrl}`);
+
+    // 로그인 성공 여부 확인 (sign-in 페이지가 아니면 성공)
+    if (!currentUrl.includes('sign-in')) {
+        isLoggedIn = true;
+        onLog('info', '로그인 성공!');
+        return { success: true };
+    } else {
+        isLoggedIn = false;
+        onLog('error', '로그인 실패: 여전히 로그인 페이지');
+        await page.screenshot({ path: './login-debug.png' });
+        return { success: false, error: '로그인 실패' };
+    }
+}
+
+/**
+ * 팝업 닫기
+ */
+async function closePopup() {
+    for (let i = 0; i < 3; i++) {
+        try {
+            const btn = page.locator('[data-e2e="classroom-confirm-modal-close"]');
+            if (await btn.isVisible({ timeout: 300 })) {
+                await btn.click({ force: true });
+                await page.waitForTimeout(300);
+            }
+        } catch (e) {}
+        try {
+            const btn = page.locator('button:has-text("처음부터 보기")');
+            if (await btn.isVisible({ timeout: 300 })) {
+                await btn.click({ force: true });
+                await page.waitForTimeout(300);
+            }
+        } catch (e) {}
+    }
+}
+
+/**
+ * 실시간 수집 결과 브로드캐스트 (정렬 후 인덱스 재할당)
+ */
+function broadcastCollectedResults(statusMap) {
+    // 정렬: Part → Chapter → Clip
+    const sorted = [...sharedCollectedResults].sort((a, b) => {
+        if (a.partNum !== b.partNum) return a.partNum - b.partNum;
+        if (a.chapterNum !== b.chapterNum) return a.chapterNum - b.chapterNum;
+        return a.clipNum - b.clipNum;
+    });
+
+    // 인덱스 재할당 및 상태 복원
+    const indexed = sorted.map((clip, idx) => {
+        const globalIndex = idx + 1;
+        const existingStatus = statusMap[globalIndex] || 'pending';
+        return {
+            ...clip,
+            index: globalIndex,
+            status: existingStatus,
+            selected: existingStatus !== 'completed'
+        };
+    });
+
+    onListUpdate(indexed);
+}
+
+/**
+ * 단일 워커가 특정 Part 범위를 수집
+ */
+async function fetchPartRange(workerPage, courseUrl, startIdx, endIdx, totalParts, statusMap, workerId) {
+    const localResults = [];
+
+    try {
+        // 페이지 이동 (load로 변경 - networkidle보다 빠름)
+        await workerPage.goto(courseUrl, { waitUntil: 'load', timeout: 60000 });
+        await workerPage.waitForTimeout(3000);
+
+    // 팝업 닫기
+    for (let i = 0; i < 3; i++) {
+        try {
+            const btn = workerPage.locator('[data-e2e="classroom-confirm-modal-close"]');
+            if (await btn.isVisible({ timeout: 300 })) {
+                await btn.click({ force: true });
+                await workerPage.waitForTimeout(300);
+            }
+        } catch (e) {}
+        try {
+            const btn = workerPage.locator('button:has-text("처음부터 보기")');
+            if (await btn.isVisible({ timeout: 300 })) {
+                await btn.click({ force: true });
+                await workerPage.waitForTimeout(300);
+            }
+        } catch (e) {}
+    }
+
+    onLog('info', `[워커${workerId}] Part ${startIdx + 1}~${endIdx} 수집 시작`);
+
+    for (let partIdx = startIdx; partIdx < endIdx; partIdx++) {
+        if (!isFetching) {
+            onLog('info', `[워커${workerId}] 중지됨`);
+            break;
+        }
+
+        const currentPartToggles = await workerPage.locator('.classroom-sidebar-clip__chapter__title').all();
+        if (partIdx >= currentPartToggles.length) break;
+
+        const partToggle = currentPartToggles[partIdx];
+        const partNum = partIdx + 1;
+
+        // Part 이름 가져오기
+        let partTitle = '';
+        try {
+            const titleEl = partToggle.locator('.classroom-sidebar-clip__chapter__title__text');
+            partTitle = await titleEl.textContent();
+            partTitle = partTitle.trim();
+        } catch (e) {
+            partTitle = `Part ${partNum}`;
+        }
+
+        onLog('info', `[워커${workerId}] 📂 PART ${partNum}: ${partTitle.slice(0, 30)}`);
+
+        // Part 컨테이너
+        let partContainer;
+        try {
+            partContainer = partToggle.locator('..').locator('..').locator('..');
+            await partContainer.scrollIntoViewIfNeeded({ timeout: 3000 });
+            const partHeader = partToggle.locator('..');
+            await partHeader.click({ force: true });
+            await workerPage.waitForTimeout(1000);
+        } catch (e) {
+            continue;
+        }
+
+        // 팝업 닫기
+        try {
+            const btn = workerPage.locator('[data-e2e="classroom-confirm-modal-close"]');
+            if (await btn.isVisible({ timeout: 300 })) {
+                await btn.click({ force: true });
+            }
+        } catch (e) {}
+
+        // Chapter 토글들
+        const chapterToggles = await partContainer.locator('.classroom-sidebar-clip__chapter__part__title').all();
+
+        let chapterNum = 0;
+
+        for (let chIdx = 0; chIdx < chapterToggles.length; chIdx++) {
+            const currentChapterToggles = await partContainer.locator('.classroom-sidebar-clip__chapter__part__title').all();
+            if (chIdx >= currentChapterToggles.length) break;
+
+            const chapterToggle = currentChapterToggles[chIdx];
+
+            // Chapter 이름
+            let chapterTitle = '';
+            let chapterPrefix = '';
+            try {
+                chapterTitle = await chapterToggle.textContent();
+                chapterTitle = chapterTitle.trim();
+                const prefixMatch = chapterTitle.match(/^(Ch\s*\d+|CH\s*\d+)/i);
+                chapterPrefix = prefixMatch ? prefixMatch[1].replace(/\s+/g, '') : `Ch${chIdx + 1}`;
+            } catch (e) {
+                chapterTitle = `Ch ${chIdx + 1}`;
+                chapterPrefix = `Ch${chIdx + 1}`;
+            }
+
+            chapterNum++;
+
+            // Chapter 펼치기
+            try {
+                const parentToggle = chapterToggle.locator('..');
+                await parentToggle.scrollIntoViewIfNeeded({ timeout: 3000 });
+                const accordionMenu = parentToggle.locator('..');
+                const isOpen = await accordionMenu.evaluate(el => el.classList.contains('common-accordion-menu--open'));
+                if (!isOpen) {
+                    await parentToggle.click({ force: true });
+                    await workerPage.waitForTimeout(800);
+                }
+            } catch (e) {
+                continue;
+            }
+
+            // 팝업 닫기
+            try {
+                const btn = workerPage.locator('[data-e2e="classroom-confirm-modal-close"]');
+                if (await btn.isVisible({ timeout: 300 })) {
+                    await btn.click({ force: true });
+                }
+            } catch (e) {}
+
+            await workerPage.waitForTimeout(300);
+
+            // 클립들
+            let clipElements = [];
+            try {
+                const chapterContainer = chapterToggle.locator('..').locator('..');
+                clipElements = await chapterContainer.locator('.classroom-sidebar-clip__chapter__clip__title').all();
+            } catch (e) {
+                continue;
+            }
+
+            for (let clipIdx = 0; clipIdx < clipElements.length; clipIdx++) {
+                let title = '';
+                try {
+                    const currentChToggles = await partContainer.locator('.classroom-sidebar-clip__chapter__part__title').all();
+                    const chapterContainer = currentChToggles[chIdx].locator('..').locator('..');
+                    const clips = await chapterContainer.locator('.classroom-sidebar-clip__chapter__clip__title').all();
+                    if (clipIdx >= clips.length) continue;
+                    title = await clips[clipIdx].textContent();
+                    title = title.trim();
+                } catch (e) {
+                    title = `Clip ${clipIdx + 1}`;
+                }
+
+                const newClip = {
+                    partNum,
+                    partTitle,
+                    chapterNum,
+                    chapterTitle,
+                    chapterPrefix,
+                    clipNum: clipIdx + 1,
+                    title,
+                    m3u8_url: null
+                };
+                localResults.push(newClip);
+
+                // 공유 배열에 추가 및 실시간 브로드캐스트
+                sharedCollectedResults.push(newClip);
+                broadcastCollectedResults(statusMap);
+            }
+        }
+
+        // Part 완료 시 진행률 업데이트
+        completedPartsCount++;
+        onProgress({
+            type: 'fetch',
+            current: completedPartsCount,
+            total: totalPartsCount,
+            percent: Math.round((completedPartsCount / totalPartsCount) * 100)
+        });
+    }
+
+    onLog('info', `[워커${workerId}] 완료: ${localResults.length}개 클립`);
+
+    } catch (error) {
+        onLog('error', `[워커${workerId}] 오류 발생: ${error.message}`);
+    }
+
+    return localResults; // 수집된 것까지만 반환
+}
+
+/**
+ * 목록 수집 중지
+ */
+function stopFetch() {
+    if (isFetching) {
+        isFetching = false;
+        onLog('warn', '목록 수집 중지 요청됨');
+    }
+}
+
+/**
+ * 강의 목록 수집 (병렬)
+ */
+async function fetchList(courseUrl) {
+    if (!browserContext) {
+        return { success: false, error: '먼저 로그인하세요' };
+    }
+
+    if (isFetching) {
+        return { success: false, error: '이미 목록 수집 중입니다' };
+    }
+
+    isFetching = true;
+
+    // 공유 결과 배열 초기화
+    sharedCollectedResults = [];
+
+    // 기존 상태 로드
+    const savedStatus = loadStatus();
+    const statusMap = {};
+    savedStatus.forEach(s => {
+        statusMap[s.index] = s.status;
+    });
+
+    onLog('info', '강의 페이지로 이동 중...');
+    onProgress({ type: 'fetch', current: 0, total: 100, percent: 0 });
+
+    await page.goto(courseUrl, { waitUntil: 'networkidle', timeout: 60000 });
+    await page.waitForTimeout(3000);
+    await closePopup();
+
+    onLog('info', '강의 구조 분석 중...');
+
+    // Part 토글들 개수 확인
+    const partToggles = await page.locator('.classroom-sidebar-clip__chapter__title').all();
+    const totalParts = partToggles.length;
+    totalPartsCount = totalParts;
+    completedPartsCount = 0;
+    onLog('info', `${totalParts}개 Part 발견 → ${PARALLEL_WORKERS}개 워커로 병렬 수집`);
+    onProgress({ type: 'fetch', current: 0, total: totalParts, percent: 0 });
+
+    // 워커별 Part 범위 계산
+    const partsPerWorker = Math.ceil(totalParts / PARALLEL_WORKERS);
+    const workerRanges = [];
+    for (let i = 0; i < PARALLEL_WORKERS; i++) {
+        const start = i * partsPerWorker;
+        const end = Math.min(start + partsPerWorker, totalParts);
+        if (start < totalParts) {
+            workerRanges.push({ start, end });
+        }
+    }
+
+    // 워커 페이지들 생성 (같은 세션 공유)
+    const workerPages = [];
+    for (let i = 0; i < workerRanges.length; i++) {
+        const newPage = await browserContext.newPage();
+        workerPages.push(newPage);
+    }
+
+    // 병렬 수집 실행 (각 워커 1초 간격으로 시작)
+    const workerPromises = workerRanges.map((range, idx) =>
+        new Promise(resolve => {
+            setTimeout(async () => {
+                const result = await fetchPartRange(workerPages[idx], courseUrl, range.start, range.end, totalParts, statusMap, idx + 1);
+                resolve(result);
+            }, idx * 1000); // 워커마다 1초 딜레이
+        })
+    );
+
+    // 워커 완료 대기
+    await Promise.all(workerPromises);
+
+    // 워커 페이지들 닫기
+    for (const wp of workerPages) {
+        await wp.close();
+    }
+
+    // 공유 배열에서 최종 결과 가져오기 (이미 실시간으로 브로드캐스트됨)
+    const sorted = [...sharedCollectedResults].sort((a, b) => {
+        if (a.partNum !== b.partNum) return a.partNum - b.partNum;
+        if (a.chapterNum !== b.chapterNum) return a.chapterNum - b.chapterNum;
+        return a.clipNum - b.clipNum;
+    });
+
+    const allResults = sorted.map((clip, idx) => {
+        const globalIndex = idx + 1;
+        const existingStatus = statusMap[globalIndex] || 'pending';
+        return {
+            ...clip,
+            index: globalIndex,
+            status: existingStatus,
+            selected: existingStatus !== 'completed'
+        };
+    });
+
+    onLog('info', `총 ${allResults.length}개 클립 발견`);
+
+    // 상태 저장
+    saveStatus(allResults);
+
+    // 최종 목록 업데이트
+    onListUpdate(allResults);
+
+    isFetching = false;
+
+    onProgress({
+        type: 'fetch',
+        current: totalParts,
+        total: totalParts,
+        percent: 100
+    });
+
+    return { success: true, data: allResults, stopped: !isFetching && sharedCollectedResults.length < totalPartsCount };
+}
+
+/**
+ * 클립의 m3u8 URL 수집
+ */
+async function collectClipUrl(clip) {
+    let capturedUrl = null;
+
+    // 네트워크 응답 감시
+    const responseHandler = (response) => {
+        const url = response.url();
+        if (url.includes('.m3u8') && url.includes('kollus.com')) {
+            capturedUrl = url.replace('zcdn.kollus.com', 'ycdn.kollus.com');
+        }
+    };
+
+    page.on('response', responseHandler);
+
+    try {
+        // Part 펼치기
+        const partToggles = await page.locator('.classroom-sidebar-clip__chapter__title').all();
+        if (clip.partNum <= partToggles.length) {
+            const partToggle = partToggles[clip.partNum - 1];
+            const partContainer = partToggle.locator('..').locator('..').locator('..');
+            const partHeader = partToggle.locator('..');
+            await partHeader.click({ force: true });
+            await page.waitForTimeout(1000);
+
+            // Chapter 펼치기
+            const chapterToggles = await partContainer.locator('.classroom-sidebar-clip__chapter__part__title').all();
+            if (clip.chapterNum <= chapterToggles.length) {
+                const chapterToggle = chapterToggles[clip.chapterNum - 1];
+                const parentToggle = chapterToggle.locator('..');
+                await parentToggle.click({ force: true });
+                await page.waitForTimeout(1000);
+
+                // 클립 클릭
+                const chapterContainer = chapterToggle.locator('..').locator('..');
+                const clips = await chapterContainer.locator('.classroom-sidebar-clip__chapter__clip__title').all();
+                if (clip.clipNum <= clips.length) {
+                    await closePopup();
+                    await clips[clip.clipNum - 1].click({ force: true });
+                    await page.waitForTimeout(1500);
+                    await closePopup();
+                    await page.waitForTimeout(3000);
+                }
+            }
+        }
+    } catch (e) {
+        onLog('error', `URL 수집 실패: ${clip.title}`);
+    }
+
+    page.off('response', responseHandler);
+
+    return capturedUrl;
+}
+
+/**
+ * 단일 다운로드 시도
+ */
+function downloadVideoOnce(m3u8Url, outputPath) {
+    return new Promise((resolve) => {
+        const ffmpeg = spawn('ffmpeg', [
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '5',
+            '-i', m3u8Url,
+            '-c', 'copy',
+            '-bsf:a', 'aac_adtstoasc',
+            '-max_muxing_queue_size', '2048',
+            '-movflags', '+faststart',
+            '-progress', 'pipe:1',
+            '-loglevel', 'error',
+            '-y',
+            outputPath
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+        let duration = 0;
+        let currentTime = 0;
+
+        ffmpeg.stdout.on('data', (data) => {
+            const lines = data.toString().split('\n');
+            lines.forEach(line => {
+                if (line.startsWith('duration=')) {
+                    const val = parseFloat(line.split('=')[1]);
+                    if (!isNaN(val) && val > 0) duration = val;
+                }
+                if (line.startsWith('out_time_ms=')) {
+                    const val = parseInt(line.split('=')[1]) / 1000000;
+                    if (!isNaN(val)) currentTime = val;
+                }
+            });
+
+            // 진행률 계산
+            if (duration > 0) {
+                const percent = Math.min(100, Math.round((currentTime / duration) * 100));
+                onProgress({
+                    type: 'download',
+                    file: path.basename(outputPath),
+                    percent,
+                    currentTime,
+                    duration
+                });
+            }
+        });
+
+        ffmpeg.stderr.on('data', () => {});
+
+        let finished = false;
+
+        const timeout = setTimeout(() => {
+            if (!finished) {
+                ffmpeg.kill('SIGKILL');
+                if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+                resolve({ success: false, reason: 'timeout' });
+            }
+        }, DOWNLOAD_TIMEOUT);
+
+        ffmpeg.on('close', (code) => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timeout);
+
+            if (code === 0) {
+                resolve({ success: true });
+            } else {
+                if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+                resolve({ success: false, reason: 'ffmpeg_error' });
+            }
+        });
+
+        ffmpeg.on('error', () => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timeout);
+            resolve({ success: false, reason: 'spawn_error' });
+        });
+    });
+}
+
+/**
+ * 클립 다운로드 (재시도 포함)
+ */
+async function downloadClip(clip, outputDir) {
+    const hasChapterInTitle = /^CH?\d+/i.test(clip.title.trim());
+    const titlePart = sanitizeFilename(clip.title);
+    const chapterPart = clip.chapterPrefix || `Ch${clip.chapterNum}`;
+    const filename = hasChapterInTitle
+        ? `PART${clip.partNum}-${titlePart}.mp4`
+        : `PART${clip.partNum}-${chapterPart}-${titlePart}.mp4`;
+
+    const partDir = path.join(outputDir, sanitizeFilename(clip.partTitle));
+    if (!fs.existsSync(partDir)) {
+        fs.mkdirSync(partDir, { recursive: true });
+    }
+
+    const outputPath = path.join(partDir, filename);
+
+    // 이미 존재하면 스킵
+    if (fs.existsSync(outputPath)) {
+        onLog('info', `📁 스킵: ${filename.slice(0, 50)}`);
+        return { success: true, skipped: true };
+    }
+
+    // URL 수집 (없으면)
+    if (!clip.m3u8_url) {
+        onLog('info', `🔍 URL 수집: ${clip.title.slice(0, 40)}`);
+        clip.m3u8_url = await collectClipUrl(clip);
+        if (!clip.m3u8_url) {
+            onLog('error', `URL 수집 실패: ${clip.title.slice(0, 40)}`);
+            return { success: false, reason: 'no_url' };
+        }
+    }
+
+    // 다운로드 (최대 3회 재시도)
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        if (attempt === 1) {
+            onLog('info', `⬇️ 다운로드: ${filename.slice(0, 45)}`);
+        } else {
+            onLog('warn', `🔄 재시도 ${attempt}/${MAX_RETRIES}: ${filename.slice(0, 35)}`);
+        }
+
+        onStatusChange(clip.index, 'downloading');
+
+        const result = await downloadVideoOnce(clip.m3u8_url, outputPath);
+
+        if (result.success) {
+            onLog('info', `✅ 완료: ${filename.slice(0, 45)}`);
+            onStatusChange(clip.index, 'completed');
+            return { success: true };
+        }
+
+        if (attempt < MAX_RETRIES) {
+            onLog('warn', `⚠️ 실패 (${result.reason}), 3초 후 재시도...`);
+            await new Promise(r => setTimeout(r, 3000));
+        }
+    }
+
+    onLog('error', `❌ 최종 실패: ${filename.slice(0, 45)}`);
+    onStatusChange(clip.index, 'failed');
+    return { success: false };
+}
+
+/**
+ * 선택된 항목 다운로드
+ */
+async function downloadItems(items, outputDir) {
+    if (isRunning) {
+        return { success: false, error: '이미 다운로드가 진행 중입니다' };
+    }
+
+    isRunning = true;
+    downloadQueue = [...items];
+    let completedCount = 0;
+    let failedCount = 0;
+    const total = items.length;
+
+    if (!fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true });
+    }
+
+    onLog('info', `📥 다운로드 시작: ${total}개 항목`);
+
+    // 순차 다운로드 (URL 수집이 브라우저 필요)
+    for (const clip of downloadQueue) {
+        if (!isRunning) break;
+
+        const result = await downloadClip(clip, outputDir);
+
+        if (result.success) {
+            if (!result.skipped) completedCount++;
+        } else {
+            failedCount++;
+        }
+
+        // 전체 진행률
+        const processed = completedCount + failedCount;
+        onProgress({
+            type: 'overall',
+            completed: completedCount,
+            failed: failedCount,
+            total,
+            percent: Math.round((processed / total) * 100)
+        });
+
+        // 상태 저장
+        const allClips = loadStatus();
+        const idx = allClips.findIndex(c => c.index === clip.index);
+        if (idx >= 0) {
+            allClips[idx].status = clip.status;
+            allClips[idx].m3u8_url = clip.m3u8_url;
+        }
+        saveStatus(allClips);
+    }
+
+    isRunning = false;
+    onLog('info', `✅ 다운로드 완료: 성공 ${completedCount}, 실패 ${failedCount}`);
+
+    return {
+        success: true,
+        completed: completedCount,
+        failed: failedCount
+    };
+}
+
+/**
+ * 다운로드 중지
+ */
+function stopDownload() {
+    isRunning = false;
+    onLog('warn', '다운로드 중지 요청됨');
+}
+
+/**
+ * 상태 확인
+ */
+function getStatus() {
+    return {
+        isRunning,
+        isFetching,
+        isLoggedIn,
+        queueLength: downloadQueue.length,
+        activeDownloads
+    };
+}
+
+module.exports = {
+    setCallbacks,
+    login,
+    fetchList,
+    stopFetch,
+    downloadItems,
+    stopDownload,
+    closeBrowser,
+    getStatus,
+    loadStatus,
+    saveStatus
+};
