@@ -11,6 +11,14 @@ const DOWNLOAD_TIMEOUT = 5 * 60 * 1000; // 5분
 const MAX_RETRIES = 3;
 const MAX_CONCURRENT_DOWNLOADS = 3;
 
+// URL 수집 설정 (개선)
+const URL_COLLECT_TIMEOUT = 30 * 1000;    // URL 수집 전체 타임아웃: 30초
+const URL_CAPTURE_MAX_WAIT = 10 * 1000;   // m3u8 캡처 최대 대기: 10초
+const URL_COLLECT_RETRIES = 3;            // URL 수집 재시도 횟수
+
+// 현재 강의 URL (페이지 복구용)
+let currentCourseUrl = null;
+
 // 브라우저 인스턴스
 let browser = null;
 let browserContext = null;
@@ -453,6 +461,9 @@ async function fetchList(courseUrl) {
     onLog('info', '강의 페이지로 이동 중...');
     onProgress({ type: 'fetch', current: 0, total: 100, percent: 0 });
 
+    // 페이지 복구용 URL 저장
+    currentCourseUrl = courseUrl;
+
     await page.goto(courseUrl, { waitUntil: 'networkidle', timeout: 60000 });
     await page.waitForTimeout(3000);
     await closePopup();
@@ -552,9 +563,28 @@ async function fetchList(courseUrl) {
 }
 
 /**
- * 클립의 m3u8 URL 수집
+ * 페이지 복구 (강의 페이지로 새로고침)
  */
-async function collectClipUrl(clip) {
+async function recoverPage() {
+    if (!currentCourseUrl || !page) return false;
+
+    try {
+        onLog('warn', '🔄 페이지 복구 중...');
+        await page.goto(currentCourseUrl, { waitUntil: 'load', timeout: 30000 });
+        await page.waitForTimeout(2000);
+        await closePopup();
+        onLog('info', '✅ 페이지 복구 완료');
+        return true;
+    } catch (e) {
+        onLog('error', `❌ 페이지 복구 실패: ${e.message}`);
+        return false;
+    }
+}
+
+/**
+ * 클립의 m3u8 URL 수집 (내부 구현)
+ */
+async function collectClipUrlInternal(clip) {
     let capturedUrl = null;
 
     // 네트워크 응답 감시
@@ -574,36 +604,86 @@ async function collectClipUrl(clip) {
             const partToggle = partToggles[clip.partNum - 1];
             const partContainer = partToggle.locator('..').locator('..').locator('..');
             const partHeader = partToggle.locator('..');
-            await partHeader.click({ force: true });
-            await page.waitForTimeout(1000);
+            await partHeader.click({ force: true, timeout: 5000 });
+            await page.waitForTimeout(800);
 
             // Chapter 펼치기
             const chapterToggles = await partContainer.locator('.classroom-sidebar-clip__chapter__part__title').all();
             if (clip.chapterNum <= chapterToggles.length) {
                 const chapterToggle = chapterToggles[clip.chapterNum - 1];
                 const parentToggle = chapterToggle.locator('..');
-                await parentToggle.click({ force: true });
-                await page.waitForTimeout(1000);
+                await parentToggle.click({ force: true, timeout: 5000 });
+                await page.waitForTimeout(800);
 
                 // 클립 클릭
                 const chapterContainer = chapterToggle.locator('..').locator('..');
                 const clips = await chapterContainer.locator('.classroom-sidebar-clip__chapter__clip__title').all();
                 if (clip.clipNum <= clips.length) {
                     await closePopup();
-                    await clips[clip.clipNum - 1].click({ force: true });
-                    await page.waitForTimeout(1500);
+                    await clips[clip.clipNum - 1].click({ force: true, timeout: 5000 });
+                    await page.waitForTimeout(1000);
                     await closePopup();
-                    await page.waitForTimeout(3000);
+
+                    // m3u8 URL 캡처 대기 (최대 10초, 100ms 간격 폴링)
+                    const startTime = Date.now();
+                    while (!capturedUrl && (Date.now() - startTime) < URL_CAPTURE_MAX_WAIT) {
+                        await page.waitForTimeout(100);
+                    }
                 }
             }
         }
-    } catch (e) {
-        onLog('error', `URL 수집 실패: ${clip.title}`);
+    } finally {
+        page.off('response', responseHandler);
     }
 
-    page.off('response', responseHandler);
-
     return capturedUrl;
+}
+
+/**
+ * 클립의 m3u8 URL 수집 (타임아웃 + 재시도 래퍼)
+ */
+async function collectClipUrl(clip, retryCount = 0) {
+    // 타임아웃과 함께 URL 수집 실행
+    const collectWithTimeout = () => {
+        return new Promise(async (resolve) => {
+            const timeout = setTimeout(() => {
+                onLog('warn', `⏱️ URL 수집 타임아웃 (${URL_COLLECT_TIMEOUT/1000}초): ${clip.title.slice(0, 30)}`);
+                resolve(null);
+            }, URL_COLLECT_TIMEOUT);
+
+            try {
+                const url = await collectClipUrlInternal(clip);
+                clearTimeout(timeout);
+                resolve(url);
+            } catch (e) {
+                clearTimeout(timeout);
+                onLog('error', `URL 수집 오류: ${e.message.slice(0, 50)}`);
+                resolve(null);
+            }
+        });
+    };
+
+    const url = await collectWithTimeout();
+
+    // URL 수집 성공
+    if (url) {
+        return url;
+    }
+
+    // 재시도 (최대 URL_COLLECT_RETRIES회)
+    if (retryCount < URL_COLLECT_RETRIES - 1) {
+        onLog('warn', `🔄 URL 수집 재시도 (${retryCount + 2}/${URL_COLLECT_RETRIES}): ${clip.title.slice(0, 30)}`);
+
+        // 페이지 복구 후 재시도
+        const recovered = await recoverPage();
+        if (recovered) {
+            await page.waitForTimeout(1000);
+            return collectClipUrl(clip, retryCount + 1);
+        }
+    }
+
+    onLog('error', `❌ URL 수집 최종 실패: ${clip.title.slice(0, 30)}`);
+    return null;
 }
 
 /**
@@ -753,7 +833,7 @@ async function downloadClip(clip, outputDir) {
 }
 
 /**
- * 다운로드 - download_ex.js 방식 (워커가 큐 폴링)
+ * 다운로드 - download_ex.js 방식 (워커가 큐 폴링) - 개선 버전
  */
 async function downloadItems(items, outputDir) {
     if (isRunning) {
@@ -776,6 +856,8 @@ async function downloadItems(items, outputDir) {
     let downloadCompletedCount = 0;
     let downloadFailedCount = 0;
     let skippedCount = 0;
+    let urlCollectionDone = false;       // URL 수집 완료 플래그
+    let workersShouldStop = false;       // 워커 종료 플래그
 
     // 진행률 업데이트
     const updateProgress = () => {
@@ -815,7 +897,7 @@ async function downloadItems(items, outputDir) {
             if (attempt === 1) {
                 onLog('info', `⬇️ [진행:${activeDownloads} 대기:${downloadQueue.length}] ${clip.title.slice(0, 35)}`);
             } else {
-                onLog('warn', `🔄 재시도 ${attempt}/${MAX_RETRIES}: ${clip.title.slice(0, 30)}`);
+                onLog('warn', `🔄 다운로드 재시도 ${attempt}/${MAX_RETRIES}: ${clip.title.slice(0, 30)}`);
             }
 
             onStatusChange(clip.index, 'downloading');
@@ -837,7 +919,7 @@ async function downloadItems(items, outputDir) {
             onStatusChange(clip.index, 'completed');
             downloadCompletedCount++;
         } else {
-            onLog('error', `❌ 실패: ${clip.title.slice(0, 40)}`);
+            onLog('error', `❌ 다운로드 실패: ${clip.title.slice(0, 40)}`);
             clip.status = 'failed';
             onStatusChange(clip.index, 'failed');
             downloadFailedCount++;
@@ -847,28 +929,40 @@ async function downloadItems(items, outputDir) {
         updateProgress();
     };
 
-    // 다운로드 워커 (큐 폴링 방식)
-    const downloadWorker = async () => {
-        while (isRunning) {
-            if (downloadQueue.length > 0 && activeDownloads < MAX_CONCURRENT_DOWNLOADS) {
+    // 다운로드 워커 (큐 폴링 방식) - 개선: 정상 종료 지원
+    const downloadWorker = async (workerId) => {
+        while (!workersShouldStop) {
+            if (downloadQueue.length > 0) {
                 const job = downloadQueue.shift();
-                activeDownloads++;
-                await downloadSingleClip(job);
-                activeDownloads--;
+                if (job) {
+                    activeDownloads++;
+                    await downloadSingleClip(job);
+                    activeDownloads--;
+                }
+            } else if (urlCollectionDone && downloadQueue.length === 0) {
+                // URL 수집 완료 + 큐 비어있음 → 종료
+                break;
             } else {
+                // 큐가 비어있지만 URL 수집 중 → 대기
                 await new Promise(r => setTimeout(r, 100));
             }
         }
     };
 
-    // 워커 3개 시작 (백그라운드)
+    // 워커 3개 시작 (Promise 배열로 관리)
+    const workerPromises = [];
     for (let i = 0; i < MAX_CONCURRENT_DOWNLOADS; i++) {
-        downloadWorker();
+        workerPromises.push(downloadWorker(i + 1));
     }
 
     // URL 수집하면서 큐에 추가
+    let currentClipIndex = 0;
     for (const clip of items) {
-        if (!isRunning) break;
+        currentClipIndex++;
+        if (!isRunning) {
+            onLog('warn', `⚠️ 중지됨 (${currentClipIndex}/${total})`);
+            break;
+        }
 
         // 파일명 생성
         const hasChapterInTitle = /^CH?\d+/i.test(clip.title.trim());
@@ -886,7 +980,7 @@ async function downloadItems(items, outputDir) {
 
         // 이미 존재하면 스킵
         if (fs.existsSync(outputPath)) {
-            onLog('info', `📁 스킵: ${filename.slice(0, 45)}`);
+            onLog('info', `📁 스킵 (${currentClipIndex}/${total}): ${filename.slice(0, 40)}`);
             clip.status = 'completed';
             skippedCount++;
             urlCollectedCount++;
@@ -897,11 +991,12 @@ async function downloadItems(items, outputDir) {
 
         // URL 수집
         if (!clip.m3u8_url) {
-            onLog('info', `🔍 URL 수집 (${urlCollectedCount + 1}/${total}): ${clip.title.slice(0, 30)}`);
+            onLog('info', `🔍 URL 수집 (${currentClipIndex}/${total}) [대기:${downloadQueue.length}]: ${clip.title.slice(0, 25)}`);
             clip.m3u8_url = await collectClipUrl(clip);
 
             if (!clip.m3u8_url) {
-                onLog('error', `URL 수집 실패: ${clip.title.slice(0, 30)}`);
+                // URL 수집 최종 실패 → 스킵하고 다음으로
+                onLog('error', `⏭️ 스킵 (URL 수집 실패): ${clip.title.slice(0, 30)}`);
                 clip.status = 'failed';
                 onStatusChange(clip.index, 'failed');
                 downloadFailedCount++;
@@ -913,22 +1008,32 @@ async function downloadItems(items, outputDir) {
         }
 
         urlCollectedCount++;
+        saveClipStatus(clip);  // URL 저장
 
         // 큐에 추가 (워커가 가져감)
         downloadQueue.push({ clip, outputPath });
-        onLog('info', `📋 큐 추가 [진행:${activeDownloads} 대기:${downloadQueue.length}]`);
         updateProgress();
     }
 
-    // 남은 다운로드 완료 대기
-    onLog('info', `⏳ 남은 다운로드 완료 대기...`);
-    while (downloadQueue.length > 0 || activeDownloads > 0) {
-        onLog('info', `  대기: ${downloadQueue.length}, 진행: ${activeDownloads}, 완료: ${downloadCompletedCount}`);
-        await new Promise(r => setTimeout(r, 2000));
-    }
+    // URL 수집 완료 표시
+    urlCollectionDone = true;
+    onLog('info', `📋 URL 수집 완료, 남은 다운로드 대기 중...`);
 
+    // 워커들이 종료될 때까지 대기
+    await Promise.all(workerPromises);
+
+    // 완료 처리
+    workersShouldStop = true;
     isRunning = false;
-    onLog('info', `✅ 완료: 성공 ${downloadCompletedCount}, 스킵 ${skippedCount}, 실패 ${downloadFailedCount}`);
+
+    const totalProcessed = downloadCompletedCount + skippedCount + downloadFailedCount;
+    onLog('info', `\n${'='.repeat(50)}`);
+    onLog('info', `📊 다운로드 완료 결과`);
+    onLog('info', `   ✅ 성공: ${downloadCompletedCount}개`);
+    onLog('info', `   📁 스킵: ${skippedCount}개`);
+    onLog('info', `   ❌ 실패: ${downloadFailedCount}개`);
+    onLog('info', `   📈 총: ${totalProcessed}/${total}개`);
+    onLog('info', `${'='.repeat(50)}`);
 
     return {
         success: true,
