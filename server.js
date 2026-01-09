@@ -99,6 +99,116 @@ app.get('/api/config', (req, res) => {
     });
 });
 
+// API: 디렉토리 목록 조회 (폴더 브라우저용)
+app.get('/api/browse', (req, res) => {
+    const targetPath = req.query.path || '/';
+
+    try {
+        // 경로 정규화
+        const normalizedPath = path.resolve(targetPath);
+
+        // 디렉토리 존재 확인
+        if (!fs.existsSync(normalizedPath)) {
+            return res.json({ success: false, error: '경로가 존재하지 않습니다' });
+        }
+
+        const stat = fs.statSync(normalizedPath);
+        if (!stat.isDirectory()) {
+            return res.json({ success: false, error: '디렉토리가 아닙니다' });
+        }
+
+        // 디렉토리 내용 읽기
+        const items = fs.readdirSync(normalizedPath, { withFileTypes: true });
+
+        // 폴더만 필터링 (숨김 폴더 제외)
+        const folders = items
+            .filter(item => item.isDirectory() && !item.name.startsWith('.'))
+            .map(item => ({
+                name: item.name,
+                path: path.join(normalizedPath, item.name)
+            }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        // 상위 디렉토리
+        const parentPath = path.dirname(normalizedPath);
+        const hasParent = parentPath !== normalizedPath;
+
+        res.json({
+            success: true,
+            currentPath: normalizedPath,
+            parentPath: hasParent ? parentPath : null,
+            folders
+        });
+    } catch (error) {
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// API: 특수 경로 목록 (외장 드라이브 등)
+app.get('/api/browse/roots', (req, res) => {
+    const roots = [];
+
+    // 홈 디렉토리
+    const homeDir = require('os').homedir();
+    roots.push({ name: '홈', path: homeDir, icon: '🏠' });
+
+    // 데스크탑
+    const desktopPath = path.join(homeDir, 'Desktop');
+    if (fs.existsSync(desktopPath)) {
+        roots.push({ name: '데스크탑', path: desktopPath, icon: '🖥️' });
+    }
+
+    // 다운로드
+    const downloadsPath = path.join(homeDir, 'Downloads');
+    if (fs.existsSync(downloadsPath)) {
+        roots.push({ name: '다운로드', path: downloadsPath, icon: '📥' });
+    }
+
+    // macOS: /Volumes (외장 드라이브)
+    if (process.platform === 'darwin' && fs.existsSync('/Volumes')) {
+        const volumes = fs.readdirSync('/Volumes', { withFileTypes: true });
+        volumes
+            .filter(v => v.isDirectory() && v.name !== 'Macintosh HD')
+            .forEach(v => {
+                roots.push({
+                    name: v.name,
+                    path: path.join('/Volumes', v.name),
+                    icon: '💾'
+                });
+            });
+    }
+
+    // Linux: /media, /mnt
+    if (process.platform === 'linux') {
+        ['/media', '/mnt'].forEach(mountPoint => {
+            if (fs.existsSync(mountPoint)) {
+                const mounts = fs.readdirSync(mountPoint, { withFileTypes: true });
+                mounts
+                    .filter(m => m.isDirectory())
+                    .forEach(m => {
+                        roots.push({
+                            name: m.name,
+                            path: path.join(mountPoint, m.name),
+                            icon: '💾'
+                        });
+                    });
+            }
+        });
+    }
+
+    // Windows: 드라이브 목록
+    if (process.platform === 'win32') {
+        for (let i = 65; i <= 90; i++) {
+            const drive = String.fromCharCode(i) + ':\\';
+            if (fs.existsSync(drive)) {
+                roots.push({ name: drive, path: drive, icon: '💾' });
+            }
+        }
+    }
+
+    res.json({ success: true, roots });
+});
+
 // API: 저장된 상태 가져오기
 app.get('/api/saved-status', (req, res) => {
     const status = downloader.loadStatus();
